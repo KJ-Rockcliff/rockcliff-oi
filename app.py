@@ -65,42 +65,58 @@ def query_receipts(
     statuses: tuple,
     receipt_type: str,
     max_rows: int,
+    service_from: str | None = None,
+    service_to: str | None = None,
 ) -> pd.DataFrame:
     type_filter = ""
     if receipt_type == "lem":
-        type_filter = "AND receiptType = 'lem'"
+        type_filter = "AND r.receiptType = 'lem'"
     elif receipt_type == "general":
-        type_filter = "AND receiptType = 'general'"
+        type_filter = "AND r.receiptType = 'general'"
 
     status_placeholders = ",".join(["?" for _ in statuses])
+
+    service_filter = ""
+    if service_from and service_to:
+        service_filter = "AND r.serviceDateFrom >= ?\n          AND r.serviceDateFrom <= ?"
+
     sql = f"""
         SELECT
-            itemID,
-            receiptNumber,
-            status,
-            displayStatus,
-            submittedDatetime,
-            totalAmount,
-            currencyCode,
-            supplierParty__name,
-            receiptType,
-            MAX(attachments__itemID)             AS attachments__itemID,
-            MAX(attachments__fileName)           AS attachments__fileName,
-            MAX(attachments__links)              AS attachments__links,
-            MAX(referencingInvoices__invoiceID)  AS referencingInvoices__invoiceID
-        FROM [bronze_openinvoice].[receipt]
-        WHERE submittedDatetime >= ?
-          AND submittedDatetime <  ?
-          AND status IN ({status_placeholders})
+            r.itemID,
+            r.receiptNumber,
+            r.status,
+            r.submittedDatetime,
+            r.totalAmount,
+            r.supplierParty__name,
+            r.receiptType,
+            r.description                            AS well,
+            MAX(r.lineItems__afe__number)            AS afe_number,
+            MAX(r.lineItems__costCenter__number)     AS cost_center,
+            MAX(r.lineItems__major__code)            AS major_code,
+            MAX(r.lineItems__major__description)     AS major_desc,
+            MAX(r.lineItems__minor__code)            AS minor_code,
+            MAX(r.lineItems__minor__description)     AS minor_desc,
+            MAX(r.attachments__itemID)               AS attachments__itemID,
+            MAX(r.attachments__fileName)             AS attachments__fileName,
+            MAX(r.attachments__links)                AS attachments__links,
+            MAX(r.referencingInvoices__invoiceID)    AS referencingInvoices__invoiceID
+        FROM [bronze_openinvoice].[receipt] r
+        WHERE r.submittedDatetime >= ?
+          AND r.submittedDatetime <= ?
+          AND r.status IN ({status_placeholders})
           {type_filter}
+          {service_filter}
         GROUP BY
-            itemID, receiptNumber, status, displayStatus,
-            submittedDatetime, totalAmount, currencyCode,
-            supplierParty__name, receiptType
-        ORDER BY submittedDatetime DESC
+            r.itemID, r.receiptNumber, r.status,
+            r.submittedDatetime, r.totalAmount,
+            r.supplierParty__name, r.receiptType, r.description
+        ORDER BY r.submittedDatetime DESC
         OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
     """
-    params = [date_from, date_to] + list(statuses) + [max_rows]
+    params = [date_from, date_to] + list(statuses)
+    if service_from and service_to:
+        params += [service_from, service_to]
+    params += [max_rows]
 
     with pyodbc.connect(_conn_str()) as conn:
         return pd.read_sql(sql, conn, params=params)
@@ -234,11 +250,21 @@ with st.sidebar:
     st.header("Filters")
 
     today = date.today()
+
+    st.markdown("**Submitted Date**")
     col1, col2 = st.columns(2)
     with col1:
-        date_from = st.date_input("From", value=today - timedelta(days=90))
+        date_from = st.date_input("From", value=today - timedelta(days=90), key="sub_from")
     with col2:
-        date_to = st.date_input("To", value=today)
+        date_to = st.date_input("To", value=today, key="sub_to")
+
+    st.markdown("**Service Date**")
+    filter_service = st.checkbox("Filter by service date", value=False)
+    col3, col4 = st.columns(2)
+    with col3:
+        service_from = st.date_input("From", value=today - timedelta(days=90), key="svc_from", disabled=not filter_service)
+    with col4:
+        service_to = st.date_input("To", value=today, key="svc_to", disabled=not filter_service)
 
     status_options = ["APPROVED", "PENDING", "REJECTED", "VOIDED"]
     statuses = st.multiselect("Status", status_options, default=["APPROVED"])
@@ -276,10 +302,12 @@ if preview_btn:
             try:
                 df = query_receipts(
                     date_from=date_from.isoformat(),
-                    date_to=(date_to + timedelta(days=1)).isoformat(),  # inclusive end
+                    date_to=(date_to + timedelta(days=1)).isoformat(),
                     statuses=tuple(statuses),
                     receipt_type=receipt_type,
                     max_rows=max_records,
+                    service_from=service_from.isoformat() if filter_service else None,
+                    service_to=(service_to + timedelta(days=1)).isoformat() if filter_service else None,
                 )
                 st.session_state.df = df
                 st.session_state.zip_bytes = None
@@ -293,33 +321,74 @@ if df is not None:
     if df.empty:
         st.info("No records match the selected filters.")
     else:
-        # Optional supplier filter (post-query, avoids extra DB round-trip)
-        suppliers = sorted(df["supplierParty__name"].dropna().unique())
+        # Post-query filters (avoids extra DB round-trip)
+        suppliers   = sorted(df["supplierParty__name"].dropna().unique())
+        all_afes    = sorted(df["afe_number"].dropna().unique().tolist())
+        all_ccs     = sorted(df["cost_center"].dropna().unique().tolist())
+        all_majors  = sorted(df["major_code"].dropna().unique().tolist())
+        all_minors  = sorted(df["minor_code"].dropna().unique().tolist())
         with st.sidebar:
             selected_supplier = st.selectbox(
                 "Supplier",
                 ["All suppliers"] + suppliers,
                 key="supplier_filter",
             )
+            selected_afe = st.selectbox(
+                "AFE",
+                ["All AFEs"] + all_afes,
+                key="afe_filter",
+            )
+            selected_cc = st.selectbox(
+                "Cost Center",
+                ["All cost centers"] + all_ccs,
+                key="cc_filter",
+            )
+            selected_major = st.selectbox(
+                "Major Code",
+                ["All major codes"] + all_majors,
+                key="major_filter",
+            )
+            selected_minor = st.selectbox(
+                "Minor Code",
+                ["All minor codes"] + all_minors,
+                key="minor_filter",
+            )
 
         if selected_supplier != "All suppliers":
             df = df[df["supplierParty__name"] == selected_supplier]
+        if selected_afe != "All AFEs":
+            df = df[df["afe_number"] == selected_afe]
+        if selected_cc != "All cost centers":
+            df = df[df["cost_center"] == selected_cc]
+        if selected_major != "All major codes":
+            df = df[df["major_code"] == selected_major]
+        if selected_minor != "All minor codes":
+            df = df[df["minor_code"] == selected_minor]
 
         total_amount = float(df["totalAmount"].astype(float).sum())
         st.markdown(f"**{len(df):,} unique receipts &nbsp;|&nbsp; ${total_amount:,.2f} total**")
 
-        display_cols = [
-            "receiptNumber", "supplierParty__name", "receiptType",
-            "submittedDatetime", "totalAmount", "status",
-        ]
+        df["major"] = df["major_code"].fillna("") + " - " + df["major_desc"].fillna("")
+        df["minor"] = df["minor_code"].fillna("") + " - " + df["minor_desc"].fillna("")
+
         st.dataframe(
-            df[display_cols].rename(columns={
-                "receiptNumber": "Receipt #",
+            df[[
+                "receiptNumber", "well", "afe_number", "cost_center",
+                "major", "minor",
+                "supplierParty__name", "receiptType",
+                "submittedDatetime", "totalAmount", "status",
+            ]].rename(columns={
+                "receiptNumber":       "Receipt #",
+                "well":                "Well",
+                "afe_number":          "AFE",
+                "cost_center":         "Cost Center",
+                "major":               "Major",
+                "minor":               "Minor",
                 "supplierParty__name": "Supplier",
-                "receiptType": "Type",
-                "submittedDatetime": "Submitted",
-                "totalAmount": "Amount",
-                "status": "Status",
+                "receiptType":         "Type",
+                "submittedDatetime":   "Submitted",
+                "totalAmount":         "Amount",
+                "status":              "Status",
             }),
             use_container_width=True,
             hide_index=True,
