@@ -266,7 +266,7 @@ with st.sidebar:
     with col4:
         service_to = st.date_input("To", value=today, key="svc_to", disabled=not filter_service)
 
-    status_options = ["APPROVED", "PENDING", "REJECTED", "VOIDED"]
+    status_options = ["APPROVED", "SUBMITTED", "DISPUTED", "CANCELLED"]
     statuses = st.multiselect("Status", status_options, default=["APPROVED"])
 
     receipt_type_label = st.selectbox(
