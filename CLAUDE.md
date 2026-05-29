@@ -1,68 +1,34 @@
-# CLAUDE.md — rockcliff-oi
-
-Guidance for Claude Code when working in this repository.
+# RCE OpenInvoice Bulk PDF Downloader
 
 ## What this is
+Streamlit app for accounting team to bulk download OpenInvoice PDFs for audit purposes.
+Deployed on RCEUTIL02 at http://rceutil02:8502 as Windows service RockcliffOI.
 
-**OpenInvoice Bulk PDF Downloader** — an internal Streamlit tool for Rockcliff
-Energy Management III Accounting / Audit. It queries receipts from the data
-warehouse, lets the user filter them, and bulk-downloads the matching field
-tickets and invoices from the Enverus OpenInvoice API as a single ZIP.
+## Database
+- Server: RCESQL02 (Windows auth)
+- Database: foundation
+- Key table: bronze_openinvoice.receipt
+- Key columns: itemID, receiptNumber, status (APPROVED/SUBMITTED/DISPUTED/CANCELLED),
+  submittedDatetime, serviceDateFrom, totalAmount, supplierParty__name,
+  lineItems__afe__number, lineItems__costCenter__number,
+  lineItems__major__code, lineItems__major__description,
+  lineItems__minor__code, lineItems__minor__description,
+  attachments__links, referencingInvoices__invoiceID
 
-The entire application lives in [app.py](app.py) (single file).
+## OpenInvoice API
+- Base: https://api.openinvoice.com
+- Auth: mTLS (cert.pem + rockcliff.key) + HMAC header (mac)
+- PDF endpoints:
+  - GET /docp/supply-chain/v1/receipts/{itemID}/snapshot
+  - GET /docp/supply-chain/v1/receipts/{itemID}/attachments/{attachmentId}
+  - GET /docp/supply-chain/v1/invoices/{invoiceId}/snapshot
 
-## Run it
+## Secrets (never commit)
+- .streamlit/secrets.toml
+- cert.pem
+- rockcliff.key
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-streamlit run app.py
-```
-
-Deployed internally on host `RCEUTIL02`, port 8502 (see the portal repo).
-
-## Architecture
-
-`app.py` is organized into commented sections:
-
-- **Auth helpers** — `_make_mac()` builds an HMAC-SHA256 signature over an empty
-  body; `_session()` configures client-certificate (mTLS) auth on a
-  `requests.Session`. The OpenInvoice API requires both mTLS and the `mac` header.
-- **Database** — `query_receipts()` reads from SQL Server table
-  `[bronze_openinvoice].[receipt]` via `pyodbc` using a Trusted Connection.
-  Cached with `@st.cache_data(ttl=300)`.
-- **Download logic** — `download_receipt()` picks a document source per receipt
-  type, with fallbacks:
-  - `lem` (field tickets): attachment -> receipt snapshot
-  - `general` (invoices): invoice snapshot -> attachment -> receipt snapshot
-  - Downloads run concurrently via `ThreadPoolExecutor(max_workers=10)`.
-- **Streamlit UI** — sidebar filters (submitted/service date, status, type, plus
-  post-query supplier/AFE/cost-center/GL-code filters), preview table, then a
-  bulk download that streams results into an in-memory ZIP. Failures are
-  collected and offered as a `failures.csv`.
-
-## Secrets and configuration
-
-All secrets are read from `.streamlit/secrets.toml` (gitignored — never commit it):
-
-- `[database]` -> `server`, `database`
-- `[openinvoice]` -> `cert_path`, `key_path`, `hmac_key`
-
-The client cert/key (`*.pem`, `*.key`) are gitignored. Do not commit
-certificates, keys, or HMAC values to the repo.
-
-## Data source notes
-
-- The `receipt` table uses flattened/denormalized column names with `__`
-  separators (e.g. `supplierParty__name`, `lineItems__afe__number`). Line-item
-  fields are aggregated with `MAX(...)` and `GROUP BY` to keep one row per receipt.
-- Status values in the DB are upper-case: `APPROVED`, `SUBMITTED`, `DISPUTED`,
-  `CANCELLED`.
-
-## Conventions
-
-- Python, standard library + `pandas`, `pyodbc`, `requests`, `streamlit`
-  (see [requirements.txt](requirements.txt)).
-- Keep the single-file structure unless there is a strong reason to split.
-- This tool touches financial/audit data — verify query logic and totals against
-  the warehouse before relying on output, and confirm changes with the tool owner
-  (Kevin Johnson).
+## Deploy
+git push origin main → auto-pulls within 5 min via RockcliffApps-AutoPull task
+Force: git -C C:\dev\rockcliff-oi reset --hard origin/main
+Restart: nssm restart RockcliffOI
